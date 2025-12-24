@@ -68,6 +68,20 @@ def set_seed(seed: int = 42) -> None:
 	torch.backends.cudnn.benchmark = True
 
 
+def patch_size_for_backbone(backbone: str) -> int:
+	"""Return patch size implied by backbone name (defaults to 14)."""
+	return 8 if "8" in backbone else 14
+
+
+def align_img_size(img_size: int, backbone: str) -> int:
+	"""Floor image size to the nearest multiple of the backbone patch size."""
+	patch = patch_size_for_backbone(backbone)
+	aligned = max(patch, (img_size // patch) * patch)
+	if aligned != img_size:
+		print(f"Adjusting img_size from {img_size} to {aligned} to match patch size {patch}.")
+	return aligned
+
+
 def num_workers_hint() -> int:
 	try:
 		import psutil
@@ -127,7 +141,7 @@ class TestImageDataset(Dataset):
 		return image, path.name
 
 
-def build_transforms(img_size: int = 256) -> tuple[transforms.Compose, transforms.Compose]:
+def build_transforms(img_size: int = 224) -> tuple[transforms.Compose, transforms.Compose]:
 	train_tfms = transforms.Compose(
 		[
 			transforms.RandomResizedCrop(img_size, scale=(0.7, 1.0)),
@@ -198,7 +212,7 @@ class TrainConfig:
 	epochs: int = 5
 	lr: float = 2e-4
 	weight_decay: float = 1e-4
-	img_size: int = 256
+	img_size: int = 224
 	backbone: str = "dinov2_vits14"
 	num_workers: int = num_workers_hint()
 	device: str = "cuda" if torch.cuda.is_available() else "cpu"
@@ -223,7 +237,7 @@ def train_one_epoch(
 	for step, (images, targets) in enumerate(loader):
 		images = images.to(device, non_blocking=True)
 		targets = targets.to(device, non_blocking=True)
-		with torch.cuda.amp.autocast(enabled=device.type == "cuda"):
+		with torch.amp.autocast(device_type=device.type, enabled=device.type != "cpu"):
 			logits = model(images)
 			loss = criterion(logits, targets) / accumulation_steps
 
@@ -263,6 +277,7 @@ def evaluate(model: nn.Module, loader: DataLoader, device: torch.device) -> Tupl
 def train_model(cfg: TrainConfig) -> Path:
 	set_seed()
 	cfg.checkpoint_dir.mkdir(parents=True, exist_ok=True)
+	cfg.img_size = align_img_size(cfg.img_size, cfg.backbone)
 
 	train_tfms, eval_tfms = build_transforms(cfg.img_size)
 	full_dataset = RealFakeDataset(cfg.train_dir, transform=train_tfms)
@@ -294,7 +309,7 @@ def train_model(cfg: TrainConfig) -> Path:
 	model = DinoV2Classifier(backbone_name=cfg.backbone).to(device)
 
 	optimizer = optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=cfg.lr, weight_decay=cfg.weight_decay)
-	scaler = torch.cuda.amp.GradScaler(enabled=device.type == "cuda")
+	scaler = torch.amp.GradScaler(device_type=device.type, enabled=device.type == "cuda")
 
 	best_acc = 0.0
 	best_path = cfg.checkpoint_dir / "best.pt"
@@ -341,14 +356,18 @@ def predict(model: nn.Module, loader: DataLoader, device: torch.device) -> list[
 	return outputs
 
 
-def run_submission(checkpoint: Path, test_dir: Path, output_csv: Path, img_size: int = 256, backbone: str | None = None) -> None:
+def run_submission(checkpoint: Path, test_dir: Path, output_csv: Path, img_size: int = 224, backbone: str | None = None) -> None:
 	device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-	eval_tfms = build_transforms(img_size)[1]
+	ckpt = torch.load(checkpoint, map_location=device)
+	ckpt_cfg = ckpt.get("cfg", {}) if isinstance(ckpt, dict) else {}
+	effective_backbone = backbone or ckpt_cfg.get("backbone", "dinov2_vits14")
+	effective_img_size = align_img_size(ckpt_cfg.get("img_size", img_size), effective_backbone)
+
+	eval_tfms = build_transforms(effective_img_size)[1]
 	test_ds = TestImageDataset(test_dir, transform=eval_tfms)
 	test_loader = DataLoader(test_ds, batch_size=32, shuffle=False, num_workers=num_workers_hint(), pin_memory=True)
 
-	ckpt = torch.load(checkpoint, map_location=device)
-	model = DinoV2Classifier(backbone_name=backbone or ckpt.get("cfg", {}).get("backbone", "dinov2_vits14"))
+	model = DinoV2Classifier(backbone_name=effective_backbone)
 	model.load_state_dict(ckpt["model"], strict=False)
 	model.to(device)
 
@@ -391,7 +410,7 @@ def parse_args() -> argparse.Namespace:
 	parser.add_argument("--epochs", type=int, default=5)
 	parser.add_argument("--lr", type=float, default=2e-4)
 	parser.add_argument("--weight-decay", type=float, default=1e-4)
-	parser.add_argument("--img-size", type=int, default=256)
+	parser.add_argument("--img-size", type=int, default=224)
 	parser.add_argument("--backbone", type=str, default="dinov2_vits14")
 	parser.add_argument("--accumulation-steps", type=int, default=1)
 	parser.add_argument("--label-smoothing", type=float, default=0.05)
